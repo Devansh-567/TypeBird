@@ -420,9 +420,14 @@ window.addEventListener('resize', () => { resizeBg(); initBgElements(); });
 // ─── TIME OF DAY ───
 // Full 24-hour cinematic cycle in ~8 minutes real time
 const DAY_CYCLE_MS = 480000;
+// Use session-relative time (performance.now) so cycle NEVER wraps mid-session.
+// Pick a random starting phase per session so it feels fresh each time.
+const _todSessionOffset = Math.random(); // 0..1, random start phase
+const _todSessionStart = performance.now();
 
 function getTimeOfDay() {
-  return (Date.now() % DAY_CYCLE_MS) / DAY_CYCLE_MS; // 0..1
+  const elapsed = performance.now() - _todSessionStart;
+  return (_todSessionOffset + elapsed / DAY_CYCLE_MS) % 1;
 }
 
 // t=0: midnight, t=0.25: dawn, t=0.42: noon, t=0.7: dusk, t=0.85: night
@@ -531,12 +536,12 @@ function drawStars(tod, now) {
 }
 
 function getNightness(tod) {
-  // 0=day, 1=full night
-  if (tod < 0.22) return 1 - tod/0.22; // fading into predawn
-  if (tod < 0.32) return Math.max(0, (tod - 0.22) / 0.10 - 1) * -1 + Math.max(0, (0.32 - tod)/0.10);
-  if (tod < 0.65) return 0;
-  if (tod < 0.78) return (tod - 0.65) / 0.13;
-  return 1;
+  // 0=day, 1=full night — fully smooth, no sharp edges
+  if (tod < 0.18) return 1;                                    // full night
+  if (tod < 0.32) return 1 - (tod - 0.18) / 0.14;            // smooth dawn fade: 1→0
+  if (tod < 0.65) return 0;                                    // full day
+  if (tod < 0.80) return (tod - 0.65) / 0.15;                // smooth dusk fade: 0→1
+  return 1;                                                     // full night
 }
 
 // ─── SUN ───
@@ -1034,27 +1039,47 @@ function drawGodRays(tod, now) {
 // ─── WEATHER EFFECTS ───
 let weatherParticles = [];
 let weatherType = 'clear'; // clear, rain, snow, storm
+let weatherNextType = 'clear'; // target weather type
+let weatherTransitionAlpha = 1.0; // 1 = fully in current type, 0 = transitioning out
+let weatherTransitionSpeed = 0; // rate of fade
 let weatherTimer = 0;
+
+function triggerWeatherChange(newType) {
+  if (newType === weatherType && weatherTransitionAlpha >= 1.0) return;
+  weatherNextType = newType;
+  weatherTransitionSpeed = 0.004; // fade over ~250 frames (~4 seconds)
+}
 
 function updateWeather(tod, now) {
   weatherTimer += 0.016;
   
-  // Weather cycle (every ~45s per phase)
-  const wPhase = (now * 0.3) % (Math.PI * 2);
   const isDay = tod > 0.30 && tod < 0.75;
   const isNight = getNightness(tod) > 0.5;
   
   if (weatherTimer > 3) {
     const r = Math.random();
-    if (isDay && r < 0.002) weatherType = 'rain';
-    else if (isNight && r < 0.003) weatherType = 'snow';
-    else if (r < 0.001) { weatherType = 'storm'; }
-    else if (r < 0.005) weatherType = 'clear';
+    if (isDay && r < 0.002) triggerWeatherChange('rain');
+    else if (isNight && r < 0.003) triggerWeatherChange('snow');
+    else if (r < 0.001) triggerWeatherChange('storm');
+    else if (r < 0.005) triggerWeatherChange('clear');
     weatherTimer = 0;
   }
   
-  // Spawn weather particles
-  if (weatherType === 'rain') {
+  // Smooth transition: fade out over 4s, swap type, fade back in over 4s
+  if (weatherNextType !== weatherType) {
+    // Fading OUT current weather
+    weatherTransitionAlpha = Math.max(0, weatherTransitionAlpha - 0.004);
+    if (weatherTransitionAlpha <= 0) {
+      weatherType = weatherNextType; // swap at zero opacity
+    }
+  } else if (weatherTransitionAlpha < 1.0) {
+    // Fading IN new weather
+    weatherTransitionAlpha = Math.min(1.0, weatherTransitionAlpha + 0.004);
+  }
+  
+  // Spawn weather particles (scale spawn rate by transition alpha for smooth fade-in/out)
+  const spawnAlpha = Math.max(0, weatherTransitionAlpha);
+  if (weatherType === 'rain' && Math.random() < spawnAlpha) {
     for (let i = 0; i < 3; i++) {
       weatherParticles.push({
         x: Math.random() * BW + Math.random() * 100 - 50,
@@ -1063,7 +1088,7 @@ function updateWeather(tod, now) {
         len: 8 + Math.random() * 12,
       });
     }
-  } else if (weatherType === 'snow') {
+  } else if (weatherType === 'snow' && Math.random() < spawnAlpha) {
     for (let i = 0; i < 1; i++) {
       weatherParticles.push({
         x: Math.random() * BW, y: -5,
@@ -1083,7 +1108,7 @@ function updateWeather(tod, now) {
     if (p.y > BH + 20 || p.x < -50 || p.x > BW + 50) { weatherParticles.splice(i, 1); continue; }
     
     bgCtx.save();
-    bgCtx.globalAlpha = p.alpha * 0.6;
+    bgCtx.globalAlpha = p.alpha * 0.6 * spawnAlpha;
     
     if (p.type === 'rain') {
       bgCtx.strokeStyle = 'rgba(180,200,255,0.6)';
@@ -1134,7 +1159,7 @@ function drawLightning(tod) {
   }
   
   lightningTimer += 0.016;
-  if (weatherType === 'storm' && lightningTimer > 2 + Math.random() * 4) {
+  if (weatherType === 'storm' && weatherTransitionAlpha > 0.5 && lightningTimer > 2 + Math.random() * 4) {
     lightningTimer = 0;
     spawnLightning();
   }
@@ -1911,7 +1936,7 @@ function update(dt) {
   b.trail.unshift({x:b.x,y:b.y}); if (b.trail.length>18) b.trail.pop();
   if (b.y<28) { b.y=28; b.vy=0; }
   const groundY = canvas.height-50;
-  if (b.y>groundY-16) { if (hasPowerup('shield')) { b.y=groundY-16; b.vy=-2; } else { b.y=groundY-16; triggerDeath(); return; } }
+  if (b.y>groundY-16) { if (b.invincible>0) { b.y=groundY-16; b.vy=-2; } else if (hasPowerup('shield')) { b.y=groundY-16; b.vy=-2; b.invincible=2.0; } else { b.y=groundY-16; triggerDeath(); return; } }
   if (!G.active) { const mid=canvas.height/2; b.vy+=(mid-b.y)*.003; }
   b.vy *= .985;
   
@@ -1936,9 +1961,10 @@ function update(dt) {
       const bx=b.x,by=b.y,br=16;
       if (bx+br>o.x && bx-br<o.x+o.w) {
         if (by-br<o.gapY || by+br>o.gapY+o.gapH) {
-          if (hasPowerup('shield')) { delete G.powerups['shield']; $id('powerup-bar').querySelector('.pu-item:last-child')?.remove(); typeInp.classList.remove('shield'); shake(8,300); burst(b.x,b.y,'#76ff03',20); b.vy=-5; }
-          else if (G.mode==='survival'&&b.invincible<=0) { G.lives--; updateLivesDisplay(); b.invincible=1.5; shake(10,400); burst(b.x,b.y,'#ff4081',15); if (G.lives<=0) { triggerDeath(); return; } }
-          else if (G.mode!=='survival') { triggerDeath(); return; }
+          if (b.invincible > 0) { /* invincible — do nothing */ }
+          else if (hasPowerup('shield')) { delete G.powerups['shield']; $id('powerup-bar').querySelector('.pu-item:last-child')?.remove(); typeInp.classList.remove('shield'); shake(8,300); burst(b.x,b.y,'#76ff03',20); b.vy=-5; b.invincible=2.0; }
+          else if (G.mode==='survival') { G.lives--; updateLivesDisplay(); b.invincible=1.5; shake(10,400); burst(b.x,b.y,'#ff4081',15); if (G.lives<=0) { triggerDeath(); return; } }
+          else { triggerDeath(); return; }
         }
       }
     }

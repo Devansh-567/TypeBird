@@ -3660,6 +3660,95 @@ body {
   .go-stat-val { font-size: 1.2rem !important; }
 }
 
+/* ═══════════════════════════════════════════════════════════
+   MOBILE KEYBOARD-AWARE GAME LAYOUT — Extra CSS
+   ═══════════════════════════════════════════════════════════ */
+@media (max-width: 768px) {
+
+  /* Game screen: allow JS to override position/height freely */
+  #game-screen {
+    overflow: hidden;
+    touch-action: none;
+  }
+
+  /* Game canvas: allow JS to resize it without CSS conflict */
+  #game-canvas {
+    position: absolute !important;
+    top: 0 !important; left: 0 !important;
+    /* width/height set by JS when keyboard opens */
+    object-fit: cover;
+  }
+
+  /* Typing area default state: pinned to bottom of game screen */
+  #typing-area {
+    position: absolute !important;
+    bottom: .5rem !important;
+    left: 50% !important;
+    transform: translateX(-50%) !important;
+    width: min(96vw, 480px) !important;
+    padding: 0 !important;
+    gap: .28rem !important;
+    background: transparent !important;
+    z-index: 15 !important;
+  }
+
+  /* Input: large enough to not trigger iOS zoom, clear styling */
+  #type-input {
+    font-size: 16px !important; /* hard 16px prevents iOS auto-zoom */
+    padding: .7rem .9rem !important;
+    border-radius: 10px !important;
+    border-width: 2px !important;
+    width: 100% !important;
+    box-sizing: border-box !important;
+    background: rgba(4,5,18,.97) !important;
+    color: #dde6f0 !important;
+  }
+
+  /* Type hint: smaller on mobile */
+  #type-hint {
+    font-size: .5rem !important;
+    letter-spacing: .08em !important;
+    color: rgba(150,170,220,.6) !important;
+  }
+
+  /* Mobile KB trigger button: stays just above typing area */
+  #mobile-kb-trigger {
+    bottom: 6.8rem !important;
+  }
+
+  /* Bot HUD: move up more to clear the typing area */
+  #bot-hud {
+    bottom: 8rem !important;
+  }
+
+  /* Stash bar: move up more */
+  #stash-bar {
+    bottom: 8.2rem !important;
+  }
+
+  /* When game is active make sure all HUD fits the compressed canvas */
+  #hud {
+    padding: .4rem .65rem !important;
+  }
+
+  /* Reduce lives display gap on small screen */
+  #lives-display {
+    gap: .18rem !important;
+  }
+
+  /* Ensure gameover box is scrollable if it overflows on small phones */
+  #gameover-screen {
+    overflow-y: auto !important;
+    -webkit-overflow-scrolling: touch !important;
+    align-items: center !important;
+    justify-content: flex-start !important;
+    padding: .5rem 0 !important;
+  }
+  .go-box {
+    margin: auto !important;
+  }
+}
+
 </style>
 <body>
 
@@ -13801,13 +13890,7 @@ document.addEventListener('DOMContentLoaded', function() {
 </script>
 
 <!-- ═══════════════════════════════════════════════════════════
-     MOBILE ENHANCEMENT SCRIPT
-     - Handles mobile nav bar sync with desktop nav
-     - Virtual keyboard management
-     - Touch-to-focus typing input
-     - Swipe/tap hint overlay
-     - Canvas touch passthrough
-     - Responsive game screen adjustments
+     MOBILE ENHANCEMENT SCRIPT v2 — Keyboard layout + Performance
      ═══════════════════════════════════════════════════════════ -->
 <script>
 (function() {
@@ -13820,317 +13903,449 @@ var isMobile = function() {
     navigator.maxTouchPoints > 0;
 };
 
-/* ══════════════════════════════════════════════════════
-   1. MOBILE NAV BAR — syncs with desktop nav
-   ══════════════════════════════════════════════════════ */
-document.addEventListener('DOMContentLoaded', function() {
-  if (!isMobile()) return;
+if (!isMobile()) { return; } /* ← Desktop gets ZERO of this code */
 
-  var mobNav = document.getElementById('mobile-nav-bar');
-  if (!mobNav) return;
-  mobNav.style.display = 'flex';
+/* ═══════════════════════════════════════════════════════════
+   PART 1 — KEYBOARD-AWARE LAYOUT
+   Problem: When mobile soft keyboard opens, viewport shrinks
+   and the game canvas + typing area get hidden under the keyboard.
+   Solution: We detect the visual viewport height change, then
+   dynamically resize the game canvas so gameplay is ALWAYS visible
+   above the keyboard. The typing input stays pinned above the KB.
+   ═══════════════════════════════════════════════════════════ */
 
-  /* Wire mobile nav buttons to the same tab system */
-  var mobBtns = mobNav.querySelectorAll('.mob-nav-btn');
-  mobBtns.forEach(function(btn) {
-    btn.addEventListener('click', function() {
-      var tab = btn.getAttribute('data-tab');
+var _kbVisible = false;
+var _trueViewH = window.innerHeight; /* real screen height without KB */
+var _visualVP = window.visualViewport;
 
-      /* Activate mobile button */
-      mobBtns.forEach(function(b) { b.classList.remove('active'); });
-      btn.classList.add('active');
+/* Measure the "true" screen height before any keyboard opens */
+function getTrueHeight() { return _trueViewH; }
 
-      /* Also trigger the existing nav-btn logic */
-      var desktopBtn = document.querySelector('.nav-btn[data-tab="' + tab + '"]');
-      if (desktopBtn) desktopBtn.click();
-    });
+/* Called whenever viewport resizes (keyboard open/close) */
+function onViewportChange() {
+  var newH = _visualVP ? _visualVP.height : window.innerHeight;
+  var newW = _visualVP ? _visualVP.width  : window.innerWidth;
+  var kbHeight = _trueViewH - newH;
+
+  _kbVisible = kbHeight > 80; /* keyboard is open if viewport shrank > 80px */
+
+  var gameScreen = document.getElementById('game-screen');
+  var canvas     = document.getElementById('game-canvas');
+  var typingArea = document.getElementById('typing-area');
+  var hudEl      = document.getElementById('hud');
+  var mobKbBtn   = document.getElementById('mobile-kb-trigger');
+
+  if (!gameScreen || !canvas) return;
+
+  if (_kbVisible && window.running) {
+    /* ── KEYBOARD OPEN during game ── */
+    var availH  = Math.max(newH - 4, 200); /* visible height above keyboard */
+    var inputH  = 80; /* approx height of typing area */
+    var gameH   = availH - inputH;         /* canvas gets the rest */
+
+    /* Pin game screen to top-left of visual viewport */
+    gameScreen.style.position = 'fixed';
+    gameScreen.style.top  = (_visualVP ? _visualVP.offsetTop  : 0) + 'px';
+    gameScreen.style.left = (_visualVP ? _visualVP.offsetLeft : 0) + 'px';
+    gameScreen.style.width  = newW + 'px';
+    gameScreen.style.height = availH + 'px';
+
+    /* Resize game canvas to the available height above keyboard */
+    canvas.style.width  = newW + 'px';
+    canvas.style.height = gameH + 'px';
+
+    /* Keep the canvas pixel resolution in sync */
+    if (canvas.width !== newW || canvas.height !== gameH) {
+      canvas.width  = newW;
+      canvas.height = gameH;
+      /* Notify the game of the new canvas size */
+      if (window.G) {
+        /* Re-center bird if it's now outside bounds */
+        if (window.G.bird && window.G.bird.y > gameH - 80) {
+          window.G.bird.y = gameH * 0.45;
+        }
+      }
+    }
+
+    /* Move typing area to stick just above keyboard */
+    if (typingArea) {
+      typingArea.style.position = 'fixed';
+      typingArea.style.bottom   = '0px';
+      typingArea.style.top      = 'auto';
+      typingArea.style.left     = '50%';
+      typingArea.style.transform = 'translateX(-50%)';
+      typingArea.style.width    = Math.min(newW - 16, 500) + 'px';
+      typingArea.style.zIndex   = '999';
+      typingArea.style.padding  = '6px 0 8px';
+      typingArea.style.background = 'rgba(5,5,18,0.96)';
+      typingArea.style.borderTop  = '1px solid rgba(93,184,232,.22)';
+      typingArea.style.backdropFilter = 'blur(12px)';
+    }
+
+    /* Hide the "TAP TO TYPE" button — KB is already open */
+    if (mobKbBtn) mobKbBtn.style.display = 'none';
+
+    /* Compress HUD for smaller canvas */
+    if (hudEl) {
+      hudEl.style.padding = '.35rem .55rem';
+    }
+
+  } else {
+    /* ── KEYBOARD CLOSED / on menu ── */
+    var fullH = _trueViewH;
+
+    gameScreen.style.position = '';
+    gameScreen.style.top  = '';
+    gameScreen.style.left = '';
+    gameScreen.style.width  = '';
+    gameScreen.style.height = '';
+
+    canvas.style.width  = '';
+    canvas.style.height = '';
+
+    /* Restore canvas pixel size */
+    if (canvas.width !== newW || canvas.height !== fullH) {
+      canvas.width  = newW;
+      canvas.height = fullH;
+    }
+
+    /* Restore typing area */
+    if (typingArea) {
+      typingArea.style.position  = '';
+      typingArea.style.bottom    = '';
+      typingArea.style.left      = '';
+      typingArea.style.transform = '';
+      typingArea.style.width     = '';
+      typingArea.style.zIndex    = '';
+      typingArea.style.padding   = '';
+      typingArea.style.background = '';
+      typingArea.style.borderTop  = '';
+      typingArea.style.backdropFilter = '';
+    }
+
+    if (hudEl) {
+      hudEl.style.padding = '';
+    }
+  }
+}
+
+/* Hook into visual viewport API (supported on iOS 13+, Android Chrome 62+) */
+if (_visualVP) {
+  _trueViewH = _visualVP.height;
+  _visualVP.addEventListener('resize', onViewportChange);
+  _visualVP.addEventListener('scroll', onViewportChange);
+} else {
+  /* Fallback: use window resize */
+  window.addEventListener('resize', function() {
+    var h = window.innerHeight;
+    if (h > _trueViewH * 0.85) _trueViewH = h; /* update true height */
+    onViewportChange();
   });
+}
 
-  /* Keep mobile nav in sync when desktop nav changes */
-  var desktopBtns = document.querySelectorAll('.nav-btn[data-tab]');
-  desktopBtns.forEach(function(dBtn) {
-    var orig = dBtn.onclick;
-    dBtn.addEventListener('click', function() {
-      var tab = dBtn.getAttribute('data-tab');
-      mobBtns.forEach(function(mb) {
-        mb.classList.toggle('active', mb.getAttribute('data-tab') === tab);
-      });
-    });
-  });
+/* Also update true height on orientation change */
+window.addEventListener('orientationchange', function() {
+  setTimeout(function() {
+    _trueViewH = _visualVP ? _visualVP.height : window.innerHeight;
+    onViewportChange();
+  }, 400);
 });
 
-/* ══════════════════════════════════════════════════════
-   2. GAME INPUT — mobile keyboard management
-   ══════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════
+   PART 2 — PERFORMANCE: Lean mobile background renderer
+   Replace the heavy 15-pass background with a 4-pass version.
+   Skips: nebulas, constellations, aurora, shooters, god rays,
+   distant birds, city lights, weather, lightning.
+   Keeps: sky gradient, stars (reduced), sun/moon (simple),
+   clouds (simplified, fewer), mountains (cached offscreen).
+   ═══════════════════════════════════════════════════════════ */
+
+var _bgLastDraw   = 0;
+var _cloudLastDraw = 0;
+var _mtCache      = null;  /* offscreen canvas for mountains */
+var _mtCacheW     = 0;
+var _mtCacheTod   = -99;
+
+/* Wait for page to load before overriding */
+window.addEventListener('load', function() {
+  setTimeout(installLeanBg, 50);
+});
+
+function installLeanBg() {
+  /* Also trim stars array if it already exists */
+  if (window.stars && window.stars.length > 60) {
+    window.stars = window.stars.slice(0, 60);
+  }
+
+  /* Force shadowBlur = 0 always on mobile (biggest single perf win) */
+  window._lowFps = function() { return true; };
+
+  /* Override the renderBackground function */
+  window.renderBackground = function renderBgMobile(timestamp) {
+    /* ── Throttle ── */
+    var limit = window.running ? 50 : 70; /* 20fps game / 14fps menu */
+    if (timestamp - _bgLastDraw < limit) {
+      requestAnimationFrame(window.renderBackground);
+      return;
+    }
+    _bgLastDraw = timestamp;
+
+    var bgnow = timestamp * 0.001;
+    var BW_m  = window.BW || bgCanvas.width;
+    var BH_m  = window.BH || bgCanvas.height;
+
+    bgCtx.clearRect(0, 0, BW_m, BH_m);
+
+    /* 1. Sky gradient */
+    try {
+      var colors = getSkyColors(getTimeOfDay());
+      var tc = colors[0], bc = colors[1], hc = colors[2];
+      var g = bgCtx.createLinearGradient(0, 0, 0, BH_m);
+      g.addColorStop(0,   'rgb('+tc[0]+','+tc[1]+','+tc[2]+')');
+      g.addColorStop(0.6, 'rgb('+bc[0]+','+bc[1]+','+bc[2]+')');
+      g.addColorStop(1,   'rgb('+hc[0]+','+hc[1]+','+hc[2]+')');
+      bgCtx.fillStyle = g;
+    } catch(e) { bgCtx.fillStyle = '#0a0f14'; }
+    bgCtx.fillRect(0, 0, BW_m, BH_m);
+
+    var tod = (typeof getTimeOfDay === 'function') ? getTimeOfDay() : 0.5;
+    var night = (typeof getNightness === 'function') ? getNightness(tod) : 0;
+
+    /* 2. Stars — no shadow, no glow, no isBig cross */
+    if (night > 0.1 && window.stars) {
+      bgCtx.save();
+      for (var i = 0; i < window.stars.length; i++) {
+        var s = window.stars[i];
+        var tw = 0.5 + 0.5 * Math.sin(bgnow * s.twinkleSpeed + s.twinklePhase);
+        bgCtx.globalAlpha = Math.max(0, Math.min(0.9, night * (0.35 + 0.65*tw) * s.brightness));
+        bgCtx.fillStyle   = s.color;
+        bgCtx.beginPath();
+        bgCtx.arc(s.x, s.y, Math.max(0.3, s.r * 0.75), 0, 6.2832);
+        bgCtx.fill();
+      }
+      bgCtx.globalAlpha = 1;
+      bgCtx.restore();
+    }
+
+    /* 3. Sun — disk only, no rays/corona */
+    if (tod > 0.26 && tod < 0.81) {
+      var sp = (tod - 0.26) / (0.81 - 0.26);
+      var sx = BW_m * 0.1 + sp * BW_m * 0.8;
+      var sy = BH_m * 0.7 - Math.sin(sp * Math.PI) * BH_m * 0.52;
+      bgCtx.save();
+      bgCtx.globalAlpha = 0.80;
+      bgCtx.fillStyle   = sp < 0.5 ? '#ffaa44' : '#ffe8cc';
+      bgCtx.beginPath(); bgCtx.arc(sx, sy, 20, 0, 6.2832); bgCtx.fill();
+      bgCtx.globalAlpha = 0.12;
+      bgCtx.beginPath(); bgCtx.arc(sx, sy, 44, 0, 6.2832); bgCtx.fill();
+      bgCtx.globalAlpha = 1;
+      bgCtx.restore();
+    }
+
+    /* 4. Moon — disk only */
+    if (night > 0.08) {
+      var moonP = tod < 0.3 ? (tod + 1 - 0.85) / 0.45 : (tod - 0.85) / 0.45;
+      var mp = Math.max(0, Math.min(1, moonP));
+      var mx = BW_m * 0.15 + mp * BW_m * 0.7;
+      var my = BH_m * 0.65 - Math.sin(mp * Math.PI) * BH_m * 0.44;
+      bgCtx.save();
+      bgCtx.globalAlpha = night * 0.82;
+      bgCtx.fillStyle = '#d0d8f0';
+      bgCtx.beginPath(); bgCtx.arc(mx, my, 15, 0, 6.2832); bgCtx.fill();
+      bgCtx.globalAlpha = 1;
+      bgCtx.restore();
+    }
+
+    /* 5. Clouds — simplified ellipses, max 6, throttled to 12fps */
+    if (window.clouds && window.clouds.length) {
+      var doMoveCloud = (timestamp - _cloudLastDraw >= 83);
+      if (doMoveCloud) _cloudLastDraw = timestamp;
+      bgCtx.save();
+      var maxClouds = Math.min(window.clouds.length, 6);
+      for (var ci = 0; ci < maxClouds; ci++) {
+        var cl = window.clouds[ci];
+        if (doMoveCloud) {
+          cl.x -= cl.speed * (cl.layer === 'near' ? 1.4 : 0.7) * 0.016;
+          if (cl.x + cl.w < -50) cl.x = BW_m + cl.w;
+        }
+        bgCtx.globalAlpha = cl.alpha * 0.5;
+        bgCtx.fillStyle   = night > 0.5 ? 'rgba(180,185,220,0.7)' : 'rgba(255,255,255,0.75)';
+        bgCtx.beginPath();
+        bgCtx.ellipse(cl.x + cl.w * 0.5, cl.y, cl.w * 0.48, cl.h * 0.36, 0, 0, 6.2832);
+        bgCtx.fill();
+      }
+      bgCtx.globalAlpha = 1;
+      bgCtx.restore();
+    }
+
+    /* 6. Mountains — cached offscreen canvas */
+    if (typeof drawMountains === 'function') {
+      var todKey = Math.round(tod * 18);
+      if (!_mtCache || _mtCacheW !== BW_m || _mtCacheTod !== todKey) {
+        _mtCache = document.createElement('canvas');
+        _mtCache.width  = BW_m;
+        _mtCache.height = BH_m;
+        var mCtx = _mtCache.getContext('2d');
+        var _savedBgCtx = window.bgCtx;
+        window.bgCtx = mCtx;
+        try { drawMountains(tod); } catch(e2) {}
+        window.bgCtx = _savedBgCtx;
+        _mtCacheW   = BW_m;
+        _mtCacheTod = todKey;
+      }
+      bgCtx.drawImage(_mtCache, 0, 0);
+    }
+
+    requestAnimationFrame(window.renderBackground);
+  };
+}
+
+/* ═══════════════════════════════════════════════════════════
+   PART 3 — NAV BAR + INPUT MANAGEMENT (unchanged from v1)
+   ═══════════════════════════════════════════════════════════ */
+
 document.addEventListener('DOMContentLoaded', function() {
 
-  var typeInput = document.getElementById('type-input');
-  var gameScreen = document.getElementById('game-screen');
-  var mobKbBtn = document.getElementById('mobile-kb-trigger');
+  /* ── Mobile nav bar ── */
+  var mobNav = document.getElementById('mobile-nav-bar');
+  if (mobNav) {
+    mobNav.style.display = 'flex';
+    var mobBtns = mobNav.querySelectorAll('.mob-nav-btn');
+    mobBtns.forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        var tab = btn.getAttribute('data-tab');
+        mobBtns.forEach(function(b) { b.classList.remove('active'); });
+        btn.classList.add('active');
+        var dBtn = document.querySelector('.nav-btn[data-tab="' + tab + '"]');
+        if (dBtn) dBtn.click();
+      });
+    });
+    document.querySelectorAll('.nav-btn[data-tab]').forEach(function(dBtn) {
+      dBtn.addEventListener('click', function() {
+        var tab = dBtn.getAttribute('data-tab');
+        mobBtns.forEach(function(mb) {
+          mb.classList.toggle('active', mb.getAttribute('data-tab') === tab);
+        });
+      });
+    });
+  }
+
+  /* ── Type input management ── */
+  var typeInput  = document.getElementById('type-input');
+  var mobKbBtn   = document.getElementById('mobile-kb-trigger');
   var typingArea = document.getElementById('typing-area');
+  var gameCanvas = document.getElementById('game-canvas');
+  var _running   = false;
 
   if (!typeInput) return;
 
-  /* On mobile, show "TAP TO TYPE" button when game is running,
-     keep input focused as much as possible */
-  var _gameRunning = false;
+  /* Update type hint */
+  var hint = document.getElementById('type-hint');
+  if (hint) hint.innerHTML = 'TAP TO TYPE &nbsp;·&nbsp; WORD MAKES YOU FLY';
 
-  function showMobKb() {
-    if (isMobile() && mobKbBtn) {
-      mobKbBtn.style.display = 'flex';
-    }
-  }
-  function hideMobKb() {
-    if (mobKbBtn) mobKbBtn.style.display = 'none';
-  }
+  function showKbBtn() { if (mobKbBtn) mobKbBtn.style.display = 'flex'; }
+  function hideKbBtn() { if (mobKbBtn) mobKbBtn.style.display = 'none'; }
 
-  /* Auto-focus input on game start */
-  var _origStartGame = window.startGame;
+  /* Wrap startGame */
+  var _og1 = window.startGame;
   window.startGame = function() {
-    _gameRunning = true;
-    if (_origStartGame) _origStartGame.apply(this, arguments);
-    if (isMobile()) {
-      showMobKb();
-      setTimeout(function() {
-        typeInput.focus();
-        typeInput.click();
-      }, 800); /* wait for countdown */
-    }
+    _running = true;
+    if (_og1) _og1.apply(this, arguments);
+    showKbBtn();
+    setTimeout(function() { typeInput.focus(); }, 900);
   };
 
-  /* Hide kb button on game over / menu */
-  var _origTriggerDeath = window.triggerDeath;
+  /* Wrap triggerDeath */
+  var _og2 = window.triggerDeath;
   window.triggerDeath = function() {
-    _gameRunning = false;
-    hideMobKb();
-    if (_origTriggerDeath) _origTriggerDeath.apply(this, arguments);
+    _running = false;
+    hideKbBtn();
+    if (_og2) _og2.apply(this, arguments);
   };
 
-  /* Tap anywhere on the game canvas re-focuses the input */
-  var gameCanvas = document.getElementById('game-canvas');
+  /* Canvas tap = focus */
   if (gameCanvas) {
     gameCanvas.addEventListener('touchend', function(e) {
-      if (_gameRunning && isMobile()) {
-        e.preventDefault();
-        typeInput.focus();
-      }
+      if (_running) { e.preventDefault(); typeInput.focus(); }
+    }, { passive: false });
+  }
+  if (typingArea) {
+    typingArea.addEventListener('touchend', function() { typeInput.focus(); }, { passive: true });
+  }
+
+  /* KB button tap */
+  if (mobKbBtn) {
+    mobKbBtn.addEventListener('touchend', function(e) {
+      e.preventDefault(); typeInput.focus();
     }, { passive: false });
   }
 
-  /* Tapping the typing area focuses input */
-  if (typingArea) {
-    typingArea.addEventListener('touchend', function(e) {
-      typeInput.focus();
+  typeInput.addEventListener('blur', function() {
+    if (_running) setTimeout(function() { if (_running) showKbBtn(); }, 120);
+  });
+  typeInput.addEventListener('focus', function() { hideKbBtn(); });
+  typeInput.addEventListener('touchstart', function(e) { e.stopPropagation(); }, { passive: true });
+
+  /* ── Swipe gestures on canvas: swipe up = powerup 1, down = powerup 2 ── */
+  var _ty0 = 0, _tx0 = 0;
+  if (gameCanvas) {
+    gameCanvas.addEventListener('touchstart', function(e) {
+      if (e.touches.length === 1) { _ty0 = e.touches[0].clientY; _tx0 = e.touches[0].clientX; }
+    }, { passive: true });
+    gameCanvas.addEventListener('touchend', function(e) {
+      if (!window.running) return;
+      var dy = e.changedTouches[0].clientY - _ty0;
+      var dx = e.changedTouches[0].clientX - _tx0;
+      var ady = Math.abs(dy), adx = Math.abs(dx);
+      if (ady > 40 && ady > adx) {
+        var key = dy < 0 ? '1' : '2';
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: key, keyCode: dy<0?49:50, bubbles: true }));
+      } else if (ady < 15 && adx < 15) {
+        typeInput.focus();
+      }
     }, { passive: true });
   }
 
-  /* When input loses focus on mobile during play, show the TAP button */
-  typeInput.addEventListener('blur', function() {
-    if (_gameRunning && isMobile()) {
-      setTimeout(function() {
-        if (_gameRunning) showMobKb();
-      }, 100);
-    }
+  /* ── Touch-reliable game-over buttons ── */
+  ['btn-restart','btn-revive','btn-share','btn-menu'].forEach(function(id) {
+    var el = document.getElementById(id);
+    if (el) el.addEventListener('touchend', function(e) { e.preventDefault(); el.click(); }, { passive: false });
   });
 
-  /* When input regains focus, hide the TAP button */
-  typeInput.addEventListener('focus', function() {
-    hideMobKb();
-    /* Scroll input into view on iOS */
-    if (isMobile()) {
-      setTimeout(function() {
-        typeInput.scrollIntoView({ block: 'nearest' });
-      }, 100);
-    }
+  /* ── Prevent double-tap zoom on buttons ── */
+  document.querySelectorAll('.go-btn,.start-btn,.diff-btn,.mode-btn,.mob-nav-btn,.pause-btn').forEach(function(el) {
+    el.addEventListener('touchend', function(e) { e.preventDefault(); el.click(); }, { passive: false });
   });
 
-  /* Prevent iOS from scrolling page when keyboard appears */
-  typeInput.addEventListener('touchstart', function(e) {
-    e.stopPropagation();
-  }, { passive: true });
-
+  /* ── Stash cards touch ── */
+  var _og3 = window.startGame;
+  window.startGame = function() {
+    if (_og3) _og3.apply(this, arguments);
+    setTimeout(function() {
+      document.querySelectorAll('.stash-card').forEach(function(c) {
+        c.addEventListener('touchend', function(e) { e.preventDefault(); c.click(); }, { passive: false });
+      });
+    }, 700);
+  };
 });
 
-/* ══════════════════════════════════════════════════════
-   3. VIEWPORT HEIGHT FIX — handles iOS keyboard resize
-   ══════════════════════════════════════════════════════ */
+/* ── vh variable for CSS ── */
 function setVh() {
-  var vh = window.innerHeight * 0.01;
+  var vh = (_visualVP ? _visualVP.height : window.innerHeight) * 0.01;
   document.documentElement.style.setProperty('--vh', vh + 'px');
 }
 setVh();
 window.addEventListener('resize', setVh);
-window.addEventListener('orientationchange', function() {
-  setTimeout(setVh, 300);
-});
+window.addEventListener('orientationchange', function() { setTimeout(setVh, 350); });
 
-/* ══════════════════════════════════════════════════════
-   4. GAME CANVAS RESIZE — ensure proper sizing on mobile
-   ══════════════════════════════════════════════════════ */
+/* ── Canvas resize on orientation ── */
 window.addEventListener('orientationchange', function() {
   setTimeout(function() {
     if (window.resizeBg) window.resizeBg();
-    var gc = document.getElementById('game-canvas');
-    if (gc && window.resizeCanvas) window.resizeCanvas();
-  }, 350);
-});
-
-/* ══════════════════════════════════════════════════════
-   5. TOUCH HINT OVERLAY — brief "tap to type" animation
-      shown the first time a user lands on mobile
-   ══════════════════════════════════════════════════════ */
-document.addEventListener('DOMContentLoaded', function() {
-  if (!isMobile()) return;
-  if (localStorage.getItem('tod_mobile_hint_shown')) return;
-
-  var gameScreen = document.getElementById('game-screen');
-  if (!gameScreen) return;
-
-  /* Create the hint element */
-  var hint = document.createElement('div');
-  hint.id = 'mobile-touch-hint';
-  hint.style.cssText = [
-    'position:fixed;inset:0;z-index:9999;',
-    'display:flex;flex-direction:column;align-items:center;justify-content:center;',
-    'background:rgba(0,0,0,.75);backdrop-filter:blur(10px);',
-    'gap:1rem;pointer-events:none;',
-    'animation:mobileHintFade 3.5s ease 1.5s forwards;',
-    'opacity:0;animation-fill-mode:forwards;'
-  ].join('');
-  hint.innerHTML = [
-    '<style>',
-    '@keyframes mobileHintFade{0%{opacity:0}10%{opacity:1}70%{opacity:1}100%{opacity:0;pointer-events:none}}',
-    '@keyframes tapBounce{0%,100%{transform:scale(1) translateY(0)}50%{transform:scale(1.2) translateY(-8px)}}',
-    '</style>',
-    '<div style="font-size:3rem;animation:tapBounce 1s ease-in-out infinite;">⌨️</div>',
-    '<div style="font-family:\'Raleway\',sans-serif;font-size:.9rem;font-weight:800;color:#7de8ff;letter-spacing:.15em;text-transform:uppercase;text-align:center;">Tap Screen to Type</div>',
-    '<div style="font-family:\'Raleway\',sans-serif;font-size:.65rem;color:rgba(200,215,255,.65);text-align:center;max-width:200px;line-height:1.5;">Your keyboard pops up — just start typing words!</div>'
-  ].join('');
-
-  /* Show only during game, not menu */
-  var origStart = window.startGame;
-  window.startGame = function() {
-    if (origStart) origStart.apply(this, arguments);
-    /* Show hint on first game */
-    if (!localStorage.getItem('tod_mobile_hint_shown') && isMobile()) {
-      document.body.appendChild(hint);
-      localStorage.setItem('tod_mobile_hint_shown', '1');
-      setTimeout(function() {
-        if (hint.parentNode) hint.parentNode.removeChild(hint);
-      }, 5500);
-    }
-  };
-});
-
-/* ══════════════════════════════════════════════════════
-   6. MOBILE-SPECIFIC TYPE HINT TEXT UPDATE
-   ══════════════════════════════════════════════════════ */
-document.addEventListener('DOMContentLoaded', function() {
-  if (!isMobile()) return;
-  var hint = document.getElementById('type-hint');
-  if (hint) {
-    hint.innerHTML = 'TAP BELOW &nbsp;·&nbsp; TYPE WORD TO FLY';
-  }
-});
-
-/* ══════════════════════════════════════════════════════
-   7. PREVENT DOUBLE-TAP ZOOM ON GAME BUTTONS
-   ══════════════════════════════════════════════════════ */
-document.addEventListener('DOMContentLoaded', function() {
-  if (!isMobile()) return;
-  var touchElements = document.querySelectorAll(
-    '.go-btn,.start-btn,.diff-btn,.mode-btn,.nav-btn,.mob-nav-btn,.pause-btn'
-  );
-  touchElements.forEach(function(el) {
-    el.addEventListener('touchend', function(e) {
-      e.preventDefault();
-      el.click();
-    }, { passive: false });
-  });
-});
-
-/* ══════════════════════════════════════════════════════
-   8. SWIPE UP/DOWN ON CANVAS = power-up slot 1/2
-      (Optional gesture shortcut for mobile players)
-   ══════════════════════════════════════════════════════ */
-document.addEventListener('DOMContentLoaded', function() {
-  if (!isMobile()) return;
-
-  var canvas = document.getElementById('game-canvas');
-  if (!canvas) return;
-
-  var touchStartY = 0;
-  var touchStartX = 0;
-
-  canvas.addEventListener('touchstart', function(e) {
-    if (e.touches.length === 1) {
-      touchStartY = e.touches[0].clientY;
-      touchStartX = e.touches[0].clientX;
-    }
-  }, { passive: true });
-
-  canvas.addEventListener('touchend', function(e) {
-    if (!window.running) return;
-    var dy = (e.changedTouches[0].clientY - touchStartY);
-    var dx = (e.changedTouches[0].clientX - touchStartX);
-    var absDy = Math.abs(dy);
-    var absDx = Math.abs(dx);
-
-    /* Swipe up = activate power slot 1 */
-    if (absDy > 40 && absDy > absDx && dy < 0) {
-      var ev = new KeyboardEvent('keydown', { key: '1', keyCode: 49 });
-      document.dispatchEvent(ev);
-    }
-    /* Swipe down = activate power slot 2 */
-    else if (absDy > 40 && absDy > absDx && dy > 0) {
-      var ev2 = new KeyboardEvent('keydown', { key: '2', keyCode: 50 });
-      document.dispatchEvent(ev2);
-    }
-    /* Single tap = focus input */
-    else if (absDy < 15 && absDx < 15) {
-      document.getElementById('type-input').focus();
-    }
-  }, { passive: true });
-});
-
-/* ══════════════════════════════════════════════════════
-   9. STASH CARDS — make touch work properly
-   ══════════════════════════════════════════════════════ */
-document.addEventListener('DOMContentLoaded', function() {
-  if (!isMobile()) return;
-
-  /* Stash cards re-check after game start */
-  var origStart = window.startGame;
-  window.startGame = function() {
-    if (origStart) origStart.apply(this, arguments);
-    setTimeout(function() {
-      var stashCards = document.querySelectorAll('.stash-card');
-      stashCards.forEach(function(card) {
-        card.addEventListener('touchend', function(e) {
-          e.preventDefault();
-          card.click();
-        }, { passive: false });
-      });
-    }, 600);
-  };
-});
-
-/* ══════════════════════════════════════════════════════
-   10. GAME OVER BUTTONS — ensure tap works on mobile
-   ══════════════════════════════════════════════════════ */
-document.addEventListener('DOMContentLoaded', function() {
-  if (!isMobile()) return;
-
-  var goBtns = ['btn-restart', 'btn-revive', 'btn-share', 'btn-menu'];
-  goBtns.forEach(function(id) {
-    var btn = document.getElementById(id);
-    if (btn) {
-      btn.addEventListener('touchend', function(e) {
-        e.preventDefault();
-        btn.click();
-      }, { passive: false });
-    }
-  });
+    if (window.resizeCanvas) window.resizeCanvas();
+    _trueViewH = _visualVP ? _visualVP.height : window.innerHeight;
+    onViewportChange();
+  }, 400);
 });
 
 })();

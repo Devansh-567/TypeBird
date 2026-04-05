@@ -198,10 +198,11 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;600;700;900&family=Nunito:wght@300;400;600;700;800&family=DM+Mono:wght@300;400;500&family=Raleway:wght@300;400;600;700&display=swap" rel="stylesheet">
-<!-- ═══ FIREBASE SDK ═══ -->
+<!-- ═══ FIREBASE SDK + CLOUD SAVE ═══ -->
 <script type="module">
   import { initializeApp }    from "https://www.gstatic.com/firebasejs/11.0.1/firebase-app.js";
-  import { getFirestore, collection, addDoc, getDocs, query, orderBy, limit, where, serverTimestamp, doc, setDoc, getDoc }
+  import { getFirestore, collection, addDoc, getDocs, query, orderBy, limit, where,
+           serverTimestamp, doc, setDoc, getDoc, updateDoc }
     from "https://www.gstatic.com/firebasejs/11.0.1/firebase-firestore.js";
   import { getAuth, onAuthStateChanged, signInWithPopup, signInWithEmailAndPassword,
            createUserWithEmailAndPassword, GoogleAuthProvider, signOut, updateProfile }
@@ -218,51 +219,157 @@
     measurementId:     "G-6VPXBK4B5L"
   };
 
-  const app      = initializeApp(firebaseConfig);
-  const _db      = getFirestore(app);
-  const _auth    = getAuth(app);
-  const _gp      = new GoogleAuthProvider();
+  const app   = initializeApp(firebaseConfig);
+  const _db   = getFirestore(app);
+  const _auth = getAuth(app);
+  const _gp   = new GoogleAuthProvider();
   try { getAnalytics(app); } catch(e) {}
 
   let _uid = null, _displayName = 'Anonymous', _email = null;
 
-  // ── Sync user profile into Firestore ──
-  async function _syncUserDoc(user) {
-    if (!user) return;
+  // ══════════════════════════════════════════════════════
+  // CLOUD SAVE HELPERS
+  // Full SAVE object synced to Firestore under users/{uid}/saveData
+  // Keys that should never be pushed to cloud (local-only)
+  // ══════════════════════════════════════════════════════
+  const _LOCAL_ONLY_KEYS = new Set(['_ghostRun', 'lbLocal', 'pendingDoubleStart']);
+
+  function _saveToCloud(saveObj) {
+    if (!_uid || !saveObj) return;
+    const payload = {};
+    for (const k of Object.keys(saveObj)) {
+      if (!_LOCAL_ONLY_KEYS.has(k)) payload[k] = saveObj[k];
+    }
+    payload._cloudUpdated = Date.now();
+    setDoc(doc(_db, 'users', _uid, 'saveData', 'main'), payload, { merge: true })
+      .catch(e => console.warn('[FB] cloud save failed:', e));
+  }
+
+  // Merge cloud save onto local SAVE — cloud wins for numeric highs, arrays are unioned
+  function _mergeCloudSave(cloud) {
+    const S = window.SAVE;
+    if (!S || !cloud) return;
+
+    // High-score tables: take max per difficulty
+    if (cloud.hs) {
+      S.hs = S.hs || {};
+      for (const [k,v] of Object.entries(cloud.hs)) {
+        S.hs[k] = Math.max(S.hs[k] || 0, v || 0);
+      }
+    }
+    // Numeric highs
+    const numericMaxKeys = ['bestWpm','bestScore','totalWords','totalGames','totalCoins','coins',
+                            'dailiesCompleted','shopBuys','level','xp','bestWords'];
+    for (const k of numericMaxKeys) {
+      if (cloud[k] !== undefined) S[k] = Math.max(S[k] || 0, cloud[k] || 0);
+    }
+    // Owned skins / sounds / trails — union (never lose unlocks)
+    const arrayUnionKeys = ['ownedSkins','ownedSounds','ownedTrails','achievements'];
+    for (const k of arrayUnionKeys) {
+      if (cloud[k] && Array.isArray(cloud[k])) {
+        const existing = new Set(S[k] || []);
+        for (const v of cloud[k]) existing.add(v);
+        S[k] = Array.from(existing);
+      }
+    }
+    // Equipped skin/sound/trail — prefer cloud if set
+    for (const k of ['skin','sound','trail']) {
+      if (cloud[k] && cloud[k] !== 'classic') S[k] = cloud[k];
+    }
+    // Streak freeze, weekly score
+    if (cloud.streakFreezes) S.streakFreezes = Math.max(S.streakFreezes||0, cloud.streakFreezes);
+    if (cloud.weeklyScore)   S.weeklyScore   = Math.max(S.weeklyScore||0,   cloud.weeklyScore);
+    if (cloud.weeklyWeek)    S.weeklyWeek    = cloud.weeklyWeek;
+    // Gems
+    if (cloud.gems !== undefined) S.gems = Math.max(S.gems||0, cloud.gems||0);
+    // Save merged result locally
+    if (typeof window.savePersistNow === 'function') window.savePersistNow();
+    else try { localStorage.setItem('tf_save_v3', JSON.stringify(S)); } catch(e){}
+    console.log('[FB] Cloud save merged ✓');
+  }
+
+  async function _loadCloudSave(uid) {
+    try {
+      const snap = await getDoc(doc(_db, 'users', uid, 'saveData', 'main'));
+      if (snap.exists()) {
+        _mergeCloudSave(snap.data());
+        // Refresh menu stats after merge
+        if (typeof window.refreshMenuStats === 'function') window.refreshMenuStats();
+        if (typeof window._refreshCurrencyDisplay === 'function') window._refreshCurrencyDisplay();
+      }
+    } catch(e) { console.warn('[FB] cloud load failed:', e); }
+  }
+
+  // ── Expose cloud save push so savePersist can call it ──
+  window._fbSaveToCloud = _saveToCloud;
+
+  // ══════════════════════════════════════════════════════
+  // AUTH STATE
+  // ══════════════════════════════════════════════════════
+  async function _onLogin(user) {
     _uid = user.uid;
     _displayName = user.displayName || user.email?.split('@')[0] || 'Typist_' + user.uid.slice(0,5);
     _email = user.email;
     window._fbUid  = _uid;
     window._fbName = _displayName;
+
+    // Update profile doc
     try {
       await setDoc(doc(_db, 'users', _uid), {
         name: _displayName, email: _email || '', lastSeen: serverTimestamp()
       }, { merge: true });
     } catch(e) {}
+
+    // Pull cloud save and merge
+    await _loadCloudSave(_uid);
+
+    // Push local state to cloud (catches any progress made while offline)
+    if (window.SAVE) _saveToCloud(window.SAVE);
+
     _updateAuthUI();
+
+    // Show welcome toast
+    if (typeof window.showToast === 'function') {
+      window.showToast('☁️ Welcome back, ' + _displayName + '! Save synced.');
+    }
   }
 
-  onAuthStateChanged(_auth, u => { if (u) _syncUserDoc(u); else { _uid=null; _displayName='Guest'; window._fbUid=null; window._fbName=null; _updateAuthUI(); } });
+  function _onLogout() {
+    _uid = null; _displayName = 'Guest';
+    window._fbUid = null; window._fbName = null;
+    _updateAuthUI();
+    if (typeof window.showToast === 'function') window.showToast('👋 Signed out. Progress saved locally.');
+  }
+
+  onAuthStateChanged(_auth, u => { if (u) _onLogin(u); else _onLogout(); });
 
   function _updateAuthUI() {
-    const btn  = document.getElementById('fb-auth-btn');
-    const name = document.getElementById('fb-user-name');
+    const btn    = document.getElementById('fb-auth-btn');
+    const nameEl = document.getElementById('fb-user-name');
     const avatar = document.getElementById('fb-avatar');
     if (!btn) return;
     if (_uid) {
       btn.textContent = 'Sign Out';
-      btn.onclick = () => { signOut(_auth); };
-      if (name) name.textContent = _displayName;
+      btn.onclick = () => signOut(_auth);
+      if (nameEl) nameEl.textContent = _displayName;
       if (avatar) { avatar.textContent = _displayName[0].toUpperCase(); avatar.style.display='flex'; }
     } else {
       btn.textContent = 'Sign In';
-      btn.onclick = () => { if (window._fbOpenModal) window._fbOpenModal(); else { var m=document.getElementById('fb-auth-modal'); if(m) m.classList.remove('hidden'); } };
-      if (name) name.textContent = '';
-      if (avatar) avatar.style.display='none';
+      btn.onclick = () => { if (window._fbOpenModal) window._fbOpenModal(); };
+      if (nameEl) nameEl.textContent = '';
+      if (avatar) avatar.style.display = 'none';
     }
   }
 
-  // ── PUBLIC API ──────────────────────────────────────────
+  function _closeAuthModal() { document.getElementById('fb-auth-modal')?.classList.add('hidden'); }
+  function _showAuthErr(msg) {
+    const el = document.getElementById('fb-auth-error');
+    if (el) { el.textContent = msg.replace('Firebase:','').replace(/\(auth\/.*?\)/,'').trim(); el.style.display='block'; }
+  }
+
+  // ══════════════════════════════════════════════════════
+  // PUBLIC API
+  // ══════════════════════════════════════════════════════
   window.FB = {
     ready: true,
 
@@ -288,6 +395,9 @@
 
     signOut: () => signOut(_auth),
 
+    // Save full SAVE object to cloud now
+    pushSave: () => { if (window.SAVE) _saveToCloud(window.SAVE); },
+
     submitScore: async ({ name, score, diff, mode, wpm }) => {
       try {
         await addDoc(collection(_db, 'leaderboard'), {
@@ -307,14 +417,7 @@
     }
   };
 
-  function _closeAuthModal() { document.getElementById('fb-auth-modal')?.classList.add('hidden'); }
-  function _showAuthErr(msg) {
-    const el = document.getElementById('fb-auth-error');
-    if (el) { el.textContent = msg.replace('Firebase:','').replace(/\(auth\/.*?\)/,'').trim(); el.style.display='block'; }
-  }
-
-  // Signal readiness so non-module scripts stop blocking buttons
-  console.log('[Flytora Firebase] Connected →', firebaseConfig.projectId);
+  console.log('[Flytora] Firebase + CloudSave ready →', firebaseConfig.projectId);
   window.dispatchEvent(new CustomEvent('fb-ready'));
   document.dispatchEvent(new CustomEvent('fb-ready'));
 </script>
@@ -3884,6 +3987,23 @@ body {
   }
 }
 
+
+/* PERF: pause decorative CSS animations during gameplay */
+body.playing .mpt { animation-play-state: paused !important; }
+body.playing .skin-item.owned-legendary,
+body.playing .skin-item.owned-celestial { animation: none !important; }
+/* Streak HUD clean single display */
+#streak-hud {
+  top: 52px !important;
+  left: 50% !important;
+  transform: translateX(-50%) !important;
+  font-size: 0.82rem !important;
+  background: rgba(0,0,0,0.45) !important;
+  padding: 3px 12px !important;
+  border-radius: 20px !important;
+  border: 1px solid rgba(232,200,122,0.2) !important;
+  white-space: nowrap !important;
+}
 </style>
 <body>
 
@@ -4580,7 +4700,7 @@ body {
   </div>
   <div id="hud">
     <div class="hud-block"><div class="hud-label">Score</div><div class="hud-value" id="hud-score">0</div><div id="hud-coins-live">🪙 0</div></div>
-    <div style="display:flex;flex-direction:column;align-items:center;gap:.18rem;"><div id="combo-hud"></div><div id="hud-powerup"></div></div>
+    <div style="display:flex;flex-direction:column;align-items:center;gap:.18rem;"><div id="hud-powerup"></div></div>
     <div class="hud-block hud-right"><div class="hud-label" id="hud-level">EASY</div><div class="hud-label" id="hud-mode-label"></div><div class="hud-label" id="hud-timer" style="font-size:.88rem;color:var(--gold);margin-top:2px;"></div></div>
   </div>
   <div id="lives-display"></div>
@@ -4754,7 +4874,7 @@ body {
 <div id="heartbeat-line"></div>
 <div id="redemption-banner">🔥 REDEMPTION MODE — BOOSTED!</div>
 <div id="ghost-label">👻 GHOST BEST</div>
-<div id="combo-side"><div id="combo-side-num">0</div><div id="combo-side-label">COMBO</div></div>
+
 <div id="music-indicator" onclick="toggleBGMusic()">♪ MUSIC ON</div>
 <div id="ghost-toggle" onclick="toggleGhostRun()">👻 GHOST ON</div>
 
@@ -4883,7 +5003,7 @@ function rgbStr(c, a) {
 let stars = [];
 function initStars() {
   stars = [];
-  for (let i = 0; i < 400; i++) {
+  for (let i = 0; i < 120; i++) {
     stars.push({
       x: Math.random() * BW, y: Math.random() * BH * 0.75,
       r: Math.random() * 1.8 + 0.2,
@@ -5730,7 +5850,7 @@ function renderBackground(timestamp) {
   bgLastFrame = timestamp;
   
   // Throttle: 30fps on menu, 8fps during game (bg is barely visible during play — free the main thread)
-  const bgFpsLimit = running ? 125 : 33; // ms between frames
+  const bgFpsLimit = running ? 200 : 33; // ms between frames
   if (timestamp - bgLastDraw < bgFpsLimit) {
     requestAnimationFrame(renderBackground);
     return;
@@ -5790,11 +5910,11 @@ function renderBackground(timestamp) {
   // 11. Distant birds — skip during gameplay
   if (!running) drawDistantBirds(tod, bgNow);
   
-  // 12. Clouds (near)
-  drawClouds(tod, bgNow);
+  // 12. Clouds — skip during gameplay
+  if (!running) drawClouds(tod, bgNow);
   
-  // 13. Mountains / landscape
-  drawMountains(tod);
+  // 13. Mountains — skip during gameplay
+  if (!running) drawMountains(tod);
   
   // 14. City lights (night) — skip during gameplay
   if (!running) drawCityLights(tod, bgNow);
@@ -6311,18 +6431,32 @@ SAVE.modesPlayed  = SAVE.modesPlayed  || [];
 SAVE.dailiesCompleted = SAVE.dailiesCompleted || 0;
 SAVE.shopBuys     = SAVE.shopBuys     || 0;
 
-// Improvement 3: debounced save — batches rapid writes, force-flushes on death
+// Debounced save — local + cloud
 let _saveTimer = null;
+let _cloudSaveTimer = null;
 function _writeSave() {
   try { localStorage.setItem('tf_save_v3', JSON.stringify(SAVE)); } catch(e) { console.warn('[TF] Save failed:', e); }
+}
+function _writeCloudSave() {
+  // Debounced cloud push — at most every 5s to avoid Firestore quota
+  clearTimeout(_cloudSaveTimer);
+  _cloudSaveTimer = setTimeout(() => {
+    if (window._fbSaveToCloud && window._fbUid) window._fbSaveToCloud(SAVE);
+  }, 5000);
 }
 function savePersist() {
   clearTimeout(_saveTimer);
   _saveTimer = setTimeout(_writeSave, 300);
+  _writeCloudSave();
 }
-function savePersistNow() { // use in triggerDeath to guarantee flush before page unload
+function savePersistNow() { // force-flush on death
   clearTimeout(_saveTimer);
   _writeSave();
+  // Push to cloud immediately on game end (score/coins just changed)
+  if (window._fbSaveToCloud && window._fbUid) {
+    clearTimeout(_cloudSaveTimer);
+    window._fbSaveToCloud(SAVE);
+  }
 }
 
 window.SAVE = SAVE; // expose for TF module (let vars are not on window)
@@ -6951,6 +7085,7 @@ document.addEventListener('keydown', _unlockAudio, { once: true });
 const _particles = [];
 
 function burst(x, y, color, n, square) {
+  n = Math.min(n || 0, 10);
   n = n || 14;
   // Reduce particles at high word counts for consistent FPS
   if (G && G.words > 10) n = Math.ceil(n * 0.6);
@@ -6989,12 +7124,13 @@ function ring(x, y, color) {
 }
 
 function _drawParticles(ctx, dt) {
+  if (_particles.length > 60) _particles.length = 60;
   for (let i = _particles.length - 1; i >= 0; i--) {
     const p = _particles[i];
     p.x += p.vx; p.y += p.vy;
     p.vy += 0.15; // subtle gravity
     p.life -= dt;
-    if (p.life <= 0) { _particles.splice(i, 1); continue; }
+    if (p.life <= 0) { _particles[i] = _particles[_particles.length-1]; _particles.length--; continue; }
     const alpha = p.life / p.maxLife;
     const scale = alpha;
     ctx.globalAlpha = alpha;
@@ -7326,7 +7462,7 @@ function drawSkinPreview(canvas, sk, t) {
 
   // Shadow/glow
   ctx2.shadowColor = sk.glowColor || tier.color;
-  ctx2.shadowBlur = 10 + 4 * Math.sin(t * 2.5);
+  ctx2.shadowBlur = _lowFps() ? 0 : (10 + 4 * Math.sin(t * 2.5));
 
   // Body
   ctx2.fillStyle = sk.bodyColor;
@@ -8586,7 +8722,7 @@ function startGame() {
   $id('pause-overlay').classList.add('hidden');
   typeInp.value=''; typeInp.placeholder='waiting…'; typeInp.className='';
   $id('hud-score').textContent='0'; $id('hud-coins-live').textContent='🪙 '+SAVE.coins;
-  $id('combo-hud').textContent=''; $id('hud-powerup').textContent='';
+  $id('hud-powerup').textContent='';
   $id('hud-level').textContent=conf.label; $id('hud-mode-label').textContent=selMode.toUpperCase();
   $id('hud-timer').textContent=''; $id('mult-badge').classList.remove('visible'); $id('powerup-bar').innerHTML=''; $id('stash-bar').innerHTML='';
   if (SAVE.pendingDoubleStart) { G.stash.push('double'); SAVE.pendingDoubleStart=false; savePersist(); }
@@ -8862,12 +8998,12 @@ function update(dt) {
         if (consumeShield('a missed word')) {
           shake(6,200);
         } else {
-          G.lives--; updateLivesDisplay(); shake(12,500); sndCrash(); G.combo=0; $id('combo-hud').textContent='';
+          G.lives--; updateLivesDisplay(); shake(12,500); sndCrash(); G.combo=0;
           if (G.lives<=0) { triggerDeath(); return; }
         }
         b.vy=6; G.errFlash=0.4;
       }
-      else { b.vy=10; G.errFlash=0.6; G.combo=0; $id('combo-hud').textContent=''; sndError(); shake(10,400); if (selDiff==='insane') { triggerDeath(); return; } }
+      else { b.vy=10; G.errFlash=0.6; G.combo=0; G.errFlash=0.6; sndError(); shake(10,400); if (selDiff==='insane') { triggerDeath(); return; } }
     }
   }
   if (G.errFlash>0) G.errFlash-=dt;
@@ -9023,7 +9159,7 @@ typeInp.addEventListener('input', () => {
       completeWord(obs);
     }
   } else {
-    G.errKeys++; sndError(); G.combo=0; $id('combo-hud').textContent=''; G.errFlash=0.22;
+    G.errKeys++; sndError(); G.combo=0; G.errFlash=0.22;
     typeInp.classList.add('err'); setTimeout(()=>typeInp.classList.remove('err'),280);
     typeInp.value=val.slice(0,-1); G.typed=typeInp.value; obs.typed=G.typed;
   }
@@ -9084,8 +9220,7 @@ function completeWord(obs) {
   sndSuccess(); burst(G.bird.x,G.bird.y,'#5db8e8',16); burst(obs.x+obs.w/2,obs.gapY+obs.gapH/2,'#7ec87e',10);
   scorePopup(gained, G.bird.x, G.bird.y-35, hasPowerup('double')?'#e8a06a':'#7ec87e');
   G.bird.vy = -5.5;
-  if (G.combo>=2) { $id('combo-hud').textContent='🔥 ×'+G.combo+(G.combo>=10?' ULTRA!!':G.combo>=5?' HOT!':''); sndCombo(G.combo); if (G.combo>=5) ring(G.bird.x,G.bird.y,'#e8c87a'); }
-  else $id('combo-hud').textContent='';
+  if (G.combo>=2) { sndCombo(G.combo); if (G.combo>=5) ring(G.bird.x,G.bird.y,'#e8c87a'); }
   typeInp.value=''; G.typed=''; G.active=null;
   updateDailyProgress(); // Fix 3: per-word, not per-frame
   const elapsed=(Date.now()-G.startMs)/1000;
@@ -9114,6 +9249,7 @@ function triggerDeath(timesUp) {
   G.bird.alive = false;
   running = false;
   window.running = false;
+  document.body.classList.remove("playing");
   // Restart bot preview loop paused during gameplay
   setTimeout(() => { if (typeof _previewRaf !== 'undefined' && !_previewRaf) { _previewT = 0; _runPreviews(); } if (typeof _skinPreviewList !== 'undefined' && _skinPreviewList.length > 0 && !_skinPreviewRAF) startSkinPreviewLoop(); if (typeof _trailPreviewList !== 'undefined' && _trailPreviewList.length > 0 && !_trailPreviewRAF) startTrailPreviewLoop(); }, 300);
 
@@ -10448,7 +10584,7 @@ function completeWordGodmode(obs) {
 
   // Update combo side display
   if (_gameStreak >= 3) {
-    const cs = $id('combo-side'); const csn = $id('combo-side-num');
+    const cs = null; const csn = null;
     if (cs) cs.classList.add('visible');
     if (csn) csn.textContent = _gameStreak;
   }
@@ -10479,7 +10615,7 @@ const _hookedSndError = function() {
   if (_gameStreak >= 5) onStreakBroken();
   _gameStreak = 0;
   updateStreakHud();
-  const cs = $id('combo-side'); if (cs) cs.classList.remove('visible');
+  const cs = null; if (cs) cs.classList.remove('visible');
   if (origSndError) origSndError();
   else beep(130, 'sawtooth', .12, .1);
 };
@@ -10567,7 +10703,7 @@ window.startGame = function() {
   _gameStreak = 0;
   _prevGameStreak = 0;
   updateStreakHud();
-  const cs = $id('combo-side'); if (cs) cs.classList.remove('visible');
+  const cs = null; if (cs) cs.classList.remove('visible');
   setDanger(false, 0);
   startGhostRecording();
   _ghostFrame = 0;
